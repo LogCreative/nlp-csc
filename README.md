@@ -40,3 +40,7 @@ python run.py --model_type relm \
     --output_dir output/relm-1e-5
 ```
 The output csv will be in `output/relm-1e-5/submission_relm_xxxxx.csv`. The load_state_dict may vary a little bit on the F1 score.
+
+## Report
+
+The report (Simplified Chinese) is in [file](report/csc.pdf).
