@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from copy import deepcopy
 from transformers import BertPreTrainedModel, BertModel, BertForMaskedLM
 
@@ -12,7 +13,7 @@ class AutoCSCReLM(BertForMaskedLM):
 
     def forward(self, src_ids, trg_ids, attention_mask, output_attentions=False):
         labels = trg_ids.clone()
-        labels[(src_ids == trg_ids)] = -100
+        labels[(src_ids == trg_ids)] = -100         # Those not the same ones are the important position.
 
         outputs = self.bert(
             input_ids=src_ids,

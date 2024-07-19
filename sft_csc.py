@@ -16,6 +16,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import get_scheduler
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 from accelerate import Accelerator, DeepSpeedPlugin
+import atexit
+import functools
+import time
+import gc
+
+from torch.utils.tensorboard import SummaryWriter
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
                     datefmt="%m/%d/%Y %H:%M:%S",
@@ -57,15 +63,19 @@ class DataProcessor:
     def get_dev_examples(self, input_file, demon=False):
         return self._create_examples(
             self._read_jsonl(os.path.join(input_file)), "dev", demonstration=demon)
+
+    def get_test_examples(self, input_file, demon=False):
+        return self._create_examples(
+            self._read_jsonl(os.path.join(input_file)), "test", demonstration=demon)
     
     @staticmethod
     def _create_examples(lines, set_type, demonstration=False):
         examples = []
-        for (i, line) in enumerate(lines):
+        for line in lines:
             instruction_type = 'correct'
             if line["instruction"] in detection_instructions:
                 instruction_type = 'detect'
-            guid = "%s-%s" % (set_type, i)
+            guid = "%s-%s" % (set_type, line["id"])
             context_prefix = "Instruction:\n{instruction}\n\nInput:\n".format_map(line)
             start = line['input']
             context_suffix = "\n\nResponse:\n"
@@ -77,6 +87,19 @@ class DataProcessor:
                              src=start, trg=end, src_dev=src_dev, instruction_type=instruction_type))
 
         return examples
+
+    # @classmethod
+    # def _read_tsv(cls, input_file):
+    #     with open(input_file, "r", encoding="utf-8") as f:
+    #         lines = []
+    #         first_line = f.readline()   # ignore the first line
+    #         for line in f:
+    #             cols = line.strip().split("\t")
+    #             if len(cols) == 3:
+    #                 lines.append({"id": cols[0], "input": cols[1].split(), "output": cols[2].split())})
+    #             else:  # it is a test set
+    #                 lines.append((cols[0], cols[1].split(), []))
+    #     return lines
 
     @classmethod
     def _read_jsonl(cls, input_file):
@@ -263,11 +286,11 @@ def main():
     # Data config
     parser.add_argument("--data_dir", type=str, default="data/",
                         help="Directory to contain the input data for all tasks.")
-    parser.add_argument("--load_model_path", type=str, default="meta-llama/Llama-2-7b-hf",
+    parser.add_argument("--load_model_path", type=str, default="Qwen/Qwen1.5-7B", # baichuan-inc/Baichuan2-7B-Base
                         help="Pre-trained language model to load.")
-    parser.add_argument("--cache_dir", type=str, default="../../cache/",
+    parser.add_argument("--cache_dir", type=str, default="cache/",
                         help="Directory to store the pre-trained language models downloaded from s3.")
-    parser.add_argument("--output_dir", type=str, default="model/",
+    parser.add_argument("--output_dir", type=str, default="output/qwen-prompt3",
                         help="Directory to output predictions and checkpoints.")
     parser.add_argument("--load_ckpt", type=str, default="",
                         help="Checkpoint to load for trianing or evaluation.")
@@ -277,10 +300,14 @@ def main():
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true",
                         help="Whether to evaluate on the dev set.")
-    parser.add_argument("--train_on", type=str, default="",
+    parser.add_argument("--do_test", action="store_true",
+                        help="Whether to evaluate on the dev set.")
+    parser.add_argument("--train_on", type=str, default="mak_sft/train_data.jsonl",
                         help="Choose a training set.")
-    parser.add_argument("--eval_on", type=str, default="",
+    parser.add_argument("--eval_on", type=str, default="mak_sft/dev_data.jsonl",
                         help="Choose a dev set.")
+    parser.add_argument("--test_on", type=str, default="mak_sft/test_data.jsonl",
+                        help="Choose a test set.")
     parser.add_argument("--noise_probability", type=float, default=0.2,
                         help="Mask rate for masked-fine-tuning.")
     parser.add_argument("--mft", action="store_true",
@@ -289,10 +316,12 @@ def main():
                         help="Set this flag if you are using an uncased model.")
     parser.add_argument("--max_seq_length", type=int, default=128,
                         help="Maximum total input sequence length after word-piece tokenization.")
-    parser.add_argument("--train_batch_size", type=int, default=128,
+    parser.add_argument("--train_batch_size", type=int, default=1,
                         help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", type=int, default=256,
+    parser.add_argument("--eval_batch_size", type=int, default=1,
                         help="Total batch size for evaluation.")
+    parser.add_argument("--test_batch_size", type=int, default=1,
+                        help="Total batch size for test.")
     parser.add_argument("--learning_rate", type=float, default=3e-5,
                         help="Peak learning rate for optimization.")
     parser.add_argument("--num_train_epochs", type=float, default=3.0,
@@ -311,7 +340,7 @@ def main():
                         help="Whether not to use CUDA when available.")
     parser.add_argument("--fp16", action="store_true",
                         help="Whether to use mixed precision.")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=1024,
                         help="Random seed for initialization.")
     parser.add_argument("--lora", action="store_true",
                         help="Whether to use low rank adaption.")
@@ -319,15 +348,13 @@ def main():
                         help="Whether to use DeepSpeed.")
 
     parser.add_argument("--demon", action="store_true",)
-    parser.add_argument("--model_type", type=str, default="baichuan", choices=["baichuan", "qwen"],)
+    parser.add_argument("--model_type", type=str, default="qwen", choices=["baichuan", "qwen"],)
 
     args = parser.parse_args()
 
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     n_gpu = torch.cuda.device_count()
-    logger.info("device: {}, n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, n_gpu, "-accelerate", args.fp16))
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -339,6 +366,20 @@ def main():
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    @functools.lru_cache(maxsize=None)
+    def _cached_log_stream(filename):
+        io = open(filename, "a", buffering=1024)
+        atexit.register(io.close)
+        return io
+
+    fh = logging.StreamHandler(_cached_log_stream(os.path.join(args.output_dir, "std_out.log")))
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
+
+    logger.info(args)
+    logger.info("device: {}, n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
+        device, n_gpu, "-accelerate", args.fp16))
 
     if args.do_train:
         torch.save(args, os.path.join(args.output_dir, "train_args.bin"))
@@ -409,10 +450,10 @@ def main():
                 else:
                     assert args.model_type=="qwen"
                     peft_config = LoraConfig(
-                        r=64,
+                        r=8,
                         lora_alpha=16,
-                        target_modules=["c_attn", "c_proj", "w1", "w2"],
-                        lora_dropout=0.05,
+                        target_modules=["q_proj","k_proj","v_proj", "gate_proj", "down_proj", "up_proj"],
+                        lora_dropout=0.1,
                         bias="none",
                         task_type="CAUSAL_LM",
                     )
@@ -457,6 +498,8 @@ def main():
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size * accelerator.num_processes)
         logger.info("  Num steps = %d", args.max_train_steps)
+
+        tbwriter = SummaryWriter(log_dir=os.path.join(args.output_dir, "tfevents"))
 
         global_step = 0
         best_epoch = 0
@@ -571,11 +614,94 @@ def main():
                                 result["train_ppl"],
                                 result["eval_acc"],
                                 result["eval_token_acc"]))
+                            for k, v in result.items():
+                                if (k == "global_step"): continue
+                                tbwriter.add_scalar(k, v, result["global_step"])
 
                     printf()
                     for key in sorted(result.keys()):
                         logger.info("Epoch: %s,  %s = %s", str(epoch), key, str(result[key]))
                     logger.info("Best epoch: %s, result:  %s", str(best_epoch), str(best_result))
+        
+        # clean on every epoch
+        gc.collect()
+        if n_gpu > 0:          
+            torch.cuda.empty_cache()
+    
+    if args.do_test:
+        if args.deepspeed:
+            with open("deepspeed_configs/zero3_config.json") as f:
+                ds_config = json.load(f)
+            ds_plugin = DeepSpeedPlugin(hf_ds_config=ds_config)
+            ds_plugin.hf_ds_config.config["train_micro_batch_size_per_gpu"] = args.train_batch_size
+
+            accelerator = Accelerator(cpu=args.no_cuda, mixed_precision="fp16" if args.fp16 else "no", deepspeed_plugin=ds_plugin)
+        else:
+            accelerator = Accelerator(cpu=args.no_cuda, mixed_precision="fp16" if args.fp16 else "no")
+        device = accelerator.device
+
+
+        test_examples = processor.get_dev_examples(os.path.join(args.data_dir, args.test_on))
+        test_features = processor.convert_examples_to_features(test_examples, args.max_seq_length, tokenizer, model_type=args.model_type)
+
+        all_input_ids = torch.tensor([f.input_ids for f in test_features], dtype=torch.long)
+        all_attention_mask = torch.tensor([f.attention_mask for f in test_features], dtype=torch.long)
+        all_labels = torch.tensor([f.labels for f in test_features], dtype=torch.long)
+
+        test_data = TensorDataset(all_input_ids, all_attention_mask, all_labels)
+        test_dataloader = DataLoader(test_data, shuffle=False, batch_size=args.test_batch_size)
+        test_dataloader = accelerator.prepare(test_dataloader)
+
+        model = AutoModelForCausalLM.from_pretrained(args.load_model_path,
+                                                     cache_dir=cache_dir,
+                                                     trust_remote_code=True)
+
+        if args.lora:
+            if args.load_ckpt:
+                model = PeftModel.from_pretrained(model, args.load_ckpt, is_trainable=False)
+
+        model = accelerator.prepare(model)
+
+        model.eval()
+        all_predictions, all_labels = [], []
+        for batch in tqdm(test_dataloader, desc="Test"):
+            batch = tuple(t.to(device) for t in batch)
+            input_ids, attention_mask, labels = batch
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels)
+                logits = outputs[1]
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+
+            shift_predictions, shift_labels = accelerator.gather_for_metrics((shift_logits.argmax(dim=-1), shift_labels))
+            predictions, labels = shift_predictions[torch.where(shift_labels > 0)].to("cpu").numpy(), shift_labels[torch.where(shift_labels > 0)].to("cpu").numpy()
+            all_predictions.extend(predictions.squeeze().tolist())
+            all_labels.extend(labels.squeeze().tolist())
+
+        output_predict_file = os.path.join(args.output_dir, "submission_{}_{}.csv".format(args.model_type, int(time.time())))
+
+        def decode_result():
+            n = m = 0
+            tmp_prediction = []
+            tmp_label = []
+            with open(output_predict_file, "w") as writer:
+                writer.write("ID,Output\n")
+                for p, l in zip(all_predictions, all_labels):
+                    if l == tokenizer.eos_token_id:
+                        # writer.write(" -> ".join([tokenizer.decode(tmp_label), tokenizer.decode(tmp_prediction)]) + "\n")
+                        writer.write('{},"{}"\n'.format(n, tokenizer.decode(tmp_prediction)))
+                        n += 1
+                        m += len(tmp_label)
+                        del tmp_prediction[:]
+                        del tmp_label[:]
+                    else:
+                        tmp_prediction += [p]
+                        tmp_label += [l]
+        
+        decode_result()
+        logger.info("Predictions saved to {}".format(output_predict_file))
 
 
 if __name__ == "__main__":

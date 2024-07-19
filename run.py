@@ -16,6 +16,10 @@ from accelerate import Accelerator
 from autocsc import *
 import jsonlines
 
+import time
+import atexit
+import functools
+from torch.utils.tensorboard import SummaryWriter
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
                     datefmt="%m/%d/%Y %H:%M:%S",
@@ -168,7 +172,7 @@ class ConfusDataset(IterableDataset):
 class DataProcessor:
     """
     Processor for the data set:
-    a) in a .tsv format, i.e. src\ttrg; b) separate Chinese characters from each other by spaces; c) without headlines.
+    a) in a .tsv format, i.e. id\tsrc\ttrg; b) separate Chinese characters from each other by spaces;
     """
 
     def get_train_examples(self, data_dir, filename):
@@ -184,14 +188,18 @@ class DataProcessor:
     def _read(input_file):
         with open(input_file, "r", encoding="utf-8") as f:
             lines = []
+            first_line = f.readline()   # ignore the first line
             for line in f:
-                src, trg = line.strip().split("\t")
-                lines.append((src.split(), trg.split()))
+                cols = line.strip().split("\t")
+                if len(cols) == 3:
+                    lines.append((cols[0], cols[1].split(), cols[2].split()))
+                else:  # it is a test set
+                    lines.append((cols[0], cols[1].split(), cols[1].split()))
             return lines
 
     def _create_examples(self, lines, set_type):
         examples = []
-        for i, (src, trg) in enumerate(lines):
+        for (i, src, trg) in lines:
             guid = "%s-%s" % (set_type, i)
             if len(src) == len(trg):
                 examples.append(InputExample(guid=guid, src=src, trg=trg))
@@ -524,19 +532,19 @@ def main():
     # Data config
     parser.add_argument("--data_dir", type=str, default="data/",
                         help="Directory to contain the input data for all tasks.")
-    parser.add_argument("--train_on", type=str, default="",
+    parser.add_argument("--train_on", type=str, default="mak/train_data.tsv",
                         help="Specify a training set.")
-    parser.add_argument("--eval_on", type=str, default="",
+    parser.add_argument("--eval_on", type=str, default="mak/dev_data.tsv",
                         help="Specify a dev set.")
-    parser.add_argument("--test_on_lemon", type=str, default="",
-                        help="Specify the directory to LEMON.")
+    parser.add_argument("--test_on", type=str, default="mak/test_data.tsv",
+                        help="Specify a test set.")
     parser.add_argument("--load_model_path", type=str, default="bert-base-chinese",
                         help="Pre-trained model path to load.")
     parser.add_argument("--model_type", type=str, default="relm",
                         help="Model architecture to load.")
-    parser.add_argument("--cache_dir", type=str, default="../cache/",
+    parser.add_argument("--cache_dir", type=str, default="cache/",
                         help="Directory to store the pre-trained language models downloaded from s3.")
-    parser.add_argument("--output_dir", type=str, default="model/",
+    parser.add_argument("--output_dir", type=str, default="output/",
                         help="Directory to output predictions and checkpoints.")
     parser.add_argument("--load_state_dict", type=str, default="",
                         help="Trained model weights to load for evaluation if needed.")
@@ -546,6 +554,8 @@ def main():
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true",
                         help="Whether to evaluate on the dev set.")
+    parser.add_argument("--do_test", action="store_true",
+                        help="Whether to test on the test set.")
     parser.add_argument("--use_slow_tokenizer", action="store_true",
                         help="A slow tokenizer will be used if passed.")
     parser.add_argument("--do_lower_case", action="store_true",
@@ -556,7 +566,9 @@ def main():
                         help="Total batch size for training.")
     parser.add_argument("--eval_batch_size", type=int, default=128,
                         help="Total batch size for evaluation.")
-    parser.add_argument("--learning_rate", type=float, default=5e-5,
+    parser.add_argument("--test_batch_size", type=int, default=128,
+                        help="Total batch size for testing.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5,
                         help="Initial learning rate for Adam.")
     parser.add_argument("--num_train_epochs", type=float, default=1000.0,
                         help="Total number of training epochs to perform.")
@@ -574,19 +586,19 @@ def main():
                         help="Whether not to use CUDA when available.")
     parser.add_argument("--fp16", action="store_true",
                         help="Whether to use mixed precision.")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=1024,
                         help="Random seed for initialization.")
-    parser.add_argument("--save_steps", type=int, default=500,
+    parser.add_argument("--save_steps", type=int, default=100,
                         help="How many steps to save the checkpoint once.")
     parser.add_argument("--noise_probability", type=float, default=0.2,
                         help="Mask rate for masked-fine-tuning.")
     parser.add_argument("--mft", action="store_true",
                         help="Training with masked-fine-tuning.")
-    parser.add_argument("--detect", action="store_true",)
-    
-    parser.add_argument("--response_file",type=str)
-    parser.add_argument("--eval_mode", type=str, default="evaluate",
-                        help="evaluate or predict, for predict mode there is no true label. (The pseudo label is the same with the input)")    
+    parser.add_argument("--detect", action="store_true", )
+
+    parser.add_argument("--response_file", type=str)
+    parser.add_argument("--eval_mode", type=str, default="predict",
+                        help="evaluate or predict, for predict mode there is no true label. (The pseudo label is the same with the input)")
 
     args = parser.parse_args()
 
@@ -611,8 +623,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     n_gpu = torch.cuda.device_count()
-    logger.info("device: {}, n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, n_gpu, "-accelerate", args.fp16))
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -624,6 +634,21 @@ def main():
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+
+    @functools.lru_cache(maxsize=None)
+    def _cached_log_stream(filename):
+        io = open(filename, "a", buffering=1024)
+        atexit.register(io.close)
+        return io
+
+    fh = logging.StreamHandler(_cached_log_stream(os.path.join(args.output_dir, "std_out.log")))
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
+
+    logger.info(args)
+    logger.info("device: {}, n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
+        device, n_gpu, "-accelerate", args.fp16))
 
     if args.do_train:
         torch.save(args, os.path.join(args.output_dir, "train_args.bin"))
@@ -662,7 +687,8 @@ def main():
 
         model = AutoCSC[args.model_type].from_pretrained(args.load_model_path,
                                                          cache_dir=cache_dir,
-                                                         state_dict=torch.load(args.load_state_dict) if args.load_state_dict else None)
+                                                         state_dict=torch.load(
+                                                             args.load_state_dict, map_location=device) if args.load_state_dict else None)
 
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
@@ -683,28 +709,30 @@ def main():
                                   num_training_steps=args.max_train_steps)
 
         model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
-        
+
         if args.do_eval:
             eval_examples = processor.get_dev_examples(args.data_dir, args.eval_on)
-            eval_features = processor.convert_examples_to_features(eval_examples, args.max_seq_length, tokenizer)
+            test_features = processor.convert_examples_to_features(eval_examples, args.max_seq_length, tokenizer)
 
-            all_input_ids = torch.LongTensor([f.src_ids for f in eval_features])
-            all_input_mask = torch.LongTensor([f.attention_mask for f in eval_features])
-            all_label_ids = torch.LongTensor([f.trg_ids for f in eval_features])
+            all_input_ids = torch.LongTensor([f.src_ids for f in test_features])
+            all_input_mask = torch.LongTensor([f.attention_mask for f in test_features])
+            all_label_ids = torch.LongTensor([f.trg_ids for f in test_features])
             if relm or craspell:
-                all_ref_ids = torch.LongTensor([f.trg_ref_ids for f in eval_features])
-                eval_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids, all_ref_ids)
+                all_ref_ids = torch.LongTensor([f.trg_ref_ids for f in test_features])
+                test_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids, all_ref_ids)
             else:
-                eval_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
-            
-            eval_dataloader = DataLoader(eval_data, shuffle=False, batch_size=args.eval_batch_size)
-            eval_dataloader = accelerator.prepare(eval_dataloader)
+                test_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
+
+            test_dataloader = DataLoader(test_data, shuffle=False, batch_size=args.eval_batch_size)
+            test_dataloader = accelerator.prepare(test_dataloader)
 
     if args.do_train:
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_features))
         logger.info("  Batch size = %d", args.train_batch_size * accelerator.num_processes)
         logger.info("  Num steps = %d", args.max_train_steps)
+
+        tbwriter = SummaryWriter(log_dir=os.path.join(args.output_dir, "tfevents"))
 
         progress_bar = tqdm(range(args.max_train_steps), desc="Iteration")
         global_step = 0
@@ -725,7 +753,8 @@ def main():
                 elif craspell:
                     src_ids, attention_mask, trg_ids, noisy_src_ids = batch
                     if args.mft:
-                        src_ids, noisy_src_ids = mask_tokens_only_neg_2(src_ids, noisy_src_ids, trg_ids, tokenizer, args.noise_probability)
+                        src_ids, noisy_src_ids = mask_tokens_only_neg_2(src_ids, noisy_src_ids, trg_ids, tokenizer,
+                                                                        args.noise_probability)
                 else:
                     src_ids, attention_mask, trg_ids = batch
                     if args.mft:
@@ -760,7 +789,7 @@ def main():
 
                 if args.do_eval and global_step % args.save_steps == 0:
                     logger.info("***** Running evaluation *****")
-                    logger.info("  Num examples = %d", len(eval_features))
+                    logger.info("  Num examples = %d", len(test_features))
                     logger.info("  Batch size = %d", args.eval_batch_size * accelerator.num_processes)
 
                     def decode(input_ids):
@@ -768,7 +797,7 @@ def main():
 
                     model.eval()
                     all_inputs, all_labels, all_predictions = [], [], []
-                    for batch in tqdm(eval_dataloader):
+                    for batch in tqdm(test_dataloader):
                         batch = tuple(t.to(device) for t in batch)
                         src_ids, attention_mask, trg_ids = batch[:3]
                         with torch.no_grad():
@@ -794,7 +823,7 @@ def main():
 
                     loss = train_loss / train_steps
                     p, r, f1, fpr, tp, fp, fn = Metrics.compute(all_inputs, all_labels, all_predictions)
-    
+
                     output_tp_file = os.path.join(args.output_dir, "sents.tp")
                     with open(output_tp_file, "w") as writer:
                         for line in tp:
@@ -818,7 +847,8 @@ def main():
                     }
                     if accelerator.is_local_main_process:
                         model_to_save = model.module if hasattr(model, "module") else model
-                        output_model_file = os.path.join(args.output_dir, "step-%s_f1-%.2f.bin" % (str(global_step), result["eval_f1"]))
+                        output_model_file = os.path.join(args.output_dir,
+                                                         "step-%s_f1-%.2f.bin" % (str(global_step), result["eval_f1"]))
                         torch.save(model_to_save.state_dict(), output_model_file)
                         best_result.append((result["eval_f1"], output_model_file))
                         best_result.sort(key=lambda x: x[0], reverse=True)
@@ -832,49 +862,55 @@ def main():
                             writer.write(
                                 "Global step = %s | loss = %.3f | eval precision = %.2f | eval recall = %.2f | eval f1 = %.2f | eval fpr = %.2f\n"
                                 % (str(result["global_step"]),
-                                result["loss"],
-                                result["eval_p"],
-                                result["eval_r"],
-                                result["eval_f1"],
-                                result["eval_fpr"]))
+                                   result["loss"],
+                                   result["eval_p"],
+                                   result["eval_r"],
+                                   result["eval_f1"],
+                                   result["eval_fpr"]))
+                            for k, v in result.items():
+                                if (k == "global_step"): continue
+                                tbwriter.add_scalar(k, v, result["global_step"])
                             for key in sorted(result.keys()):
                                 logger.info("Global step: %s,  %s = %s", str(global_step), key, str(result[key]))
-
+                else:
+                    loss = train_loss / train_steps
+                    tbwriter.add_scalar("loss", loss, global_step)
+                    logger.info("Global step = %s | loss = %.3f" % (global_step, loss))
                 if global_step >= args.max_train_steps:
                     wrap = True
                     break
 
-    if args.do_eval and not args.do_train and not args.test_on_lemon:
+    if args.do_test:
         accelerator = Accelerator(cpu=args.no_cuda, mixed_precision="fp16" if args.fp16 else "no")
         device = accelerator.device
 
         model = AutoCSC[args.model_type].from_pretrained(args.load_model_path,
-                                                         state_dict=torch.load(args.load_state_dict),
+                                                         state_dict=torch.load(args.load_state_dict, map_location=device),
                                                          cache_dir=cache_dir)
         model = accelerator.prepare(model)
 
-        eval_examples = processor.get_test_examples(args.data_dir, args.eval_on)
-        logger.info("test on: {}".format(args.eval_on))
-        eval_features = processor.convert_examples_to_features(eval_examples, args.max_seq_length, tokenizer, False)
+        test_examples = processor.get_test_examples(args.data_dir, args.test_on)
+        logger.info("test on: {}".format(args.test_on))
+        test_features = processor.convert_examples_to_features(test_examples, args.max_seq_length, tokenizer, False)
 
-        all_input_ids = torch.tensor([f.src_ids for f in eval_features], dtype=torch.long)
-        all_input_mask = torch.tensor([f.attention_mask for f in eval_features], dtype=torch.long)
-        all_label_ids = torch.tensor([f.trg_ids for f in eval_features], dtype=torch.long)
+        all_input_ids = torch.tensor([f.src_ids for f in test_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.attention_mask for f in test_features], dtype=torch.long)
+        all_label_ids = torch.tensor([f.trg_ids for f in test_features], dtype=torch.long)
         if relm:
-            all_ref_ids = torch.LongTensor([f.trg_ref_ids for f in eval_features])
-            eval_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids, all_ref_ids)
+            all_ref_ids = torch.LongTensor([f.trg_ref_ids for f in test_features])
+            test_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids, all_ref_ids)
         else:
-            eval_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
+            test_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
 
-        eval_dataloader = DataLoader(eval_data, shuffle=False, batch_size=args.eval_batch_size)
-        eval_dataloader = accelerator.prepare(eval_dataloader)
+        test_dataloader = DataLoader(test_data, shuffle=False, batch_size=args.test_batch_size)
+        test_dataloader = accelerator.prepare(test_dataloader)
 
         def decode(input_ids):
             return tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=True)
 
         model.eval()
         all_inputs, all_labels, all_predictions = [], [], []
-        for batch in tqdm(eval_dataloader, leave=False):
+        for batch in tqdm(test_dataloader, leave=False):
             batch = tuple(t.to(device) for t in batch)
             src_ids, attention_mask, trg_ids = batch[:3]
             with torch.no_grad():
@@ -902,7 +938,8 @@ def main():
 
             if args.detect:
                 p, r, f1, fpr = Metrics.compute_detect(all_inputs, all_labels, all_predictions)
-                logger.info("detect: p = %.2f, r = %.2f, f1 = %.2f, fpr = %.2f \n", p * 100, r * 100, f1 * 100, fpr * 100)
+                logger.info("detect: p = %.2f, r = %.2f, f1 = %.2f, fpr = %.2f \n", p * 100, r * 100, f1 * 100,
+                            fpr * 100)
 
             p, r, f1, fpr, tp, fp, fn = Metrics.compute(all_inputs, all_labels, all_predictions)
 
@@ -913,7 +950,7 @@ def main():
                         writer.write("input: " + " ".join(input) + "\t")
                         writer.write("label: " + " ".join(label) + "\t")
                         writer.write("prediction: " + " ".join(prediction) + "\t")
-                        if prediction==label:
+                        if prediction == label:
                             writer.write("correct\n")
                         else:
                             writer.write("wrong\n")
@@ -934,80 +971,12 @@ def main():
                     logger.info("Global step: %s,  %s = %s", str(-1), key, str(result[key]))
         else:
             assert args.eval_mode == "predict"
-            output_file = os.path.join(args.output_dir, "predict_results_{}.jsonl".format(args.model_type))
-            with jsonlines.open(output_file, "w") as writer:
-                for input, prediction in zip(all_inputs, all_predictions):
-                    writer.write({"input": input, "prediction": prediction, "type": "correct" if equals(input,prediction) else "wrong"})
-
-
-    if args.test_on_lemon:
-        accelerator = Accelerator(cpu=args.no_cuda, mixed_precision="fp16" if args.fp16 else "no")
-        device = accelerator.device
-
-        model = AutoCSC[args.model_type].from_pretrained(args.load_model_path,
-                                                         state_dict=torch.load(args.load_state_dict),
-                                                         cache_dir=cache_dir)
-        model = accelerator.prepare(model)
-
-        avg = 0
-        for cat in ["gam", "car", "nov", "enc", "new", "cot", "mec", "sig"]:
-            eval_examples = processor.get_test_examples(args.test_on_lemon, cat + ".txt")
-            eval_features = processor.convert_examples_to_features(eval_examples, args.max_seq_length, tokenizer, False)
-
-            all_input_ids = torch.tensor([f.src_ids for f in eval_features], dtype=torch.long)
-            all_input_mask = torch.tensor([f.attention_mask for f in eval_features], dtype=torch.long)
-            all_label_ids = torch.tensor([f.trg_ids for f in eval_features], dtype=torch.long)
-            if relm:
-                all_ref_ids = torch.LongTensor([f.trg_ref_ids for f in eval_features])
-                eval_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids, all_ref_ids)
-            else:
-                eval_data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
-
-            eval_dataloader = DataLoader(eval_data, shuffle=False, batch_size=args.eval_batch_size)
-            eval_dataloader = accelerator.prepare(eval_dataloader)
-
-            def decode(input_ids):
-                return tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=True)
-
-            model.eval()
-            all_inputs, all_labels, all_predictions = [], [], []
-            for batch in tqdm(eval_dataloader, leave=False):
-                batch = tuple(t.to(device) for t in batch)
-                src_ids, attention_mask, trg_ids = batch[:3]
-                with torch.no_grad():
-                    outputs = model(src_ids=src_ids,
-                                    attention_mask=attention_mask,
-                                    trg_ids=trg_ids)
-                    prd_ids = outputs["predict_ids"]
-
-                src_ids, trg_ids, prd_ids = accelerator.gather_for_metrics((src_ids, trg_ids, prd_ids))
-                for s, t, p in zip(src_ids.tolist(), trg_ids.tolist(), prd_ids.tolist()):
-                    if relm:
-                        _t = [tt for tt, st in zip(t, s) if st == tokenizer.mask_token_id]
-                        _p = [pt for pt, st in zip(p, s) if st == tokenizer.mask_token_id]
-
-                        all_inputs += [decode(s)]
-                        all_labels += [decode(_t)]
-                        all_predictions += [decode(_p)]
-
-                    else:
-                        all_inputs += [decode(s)]
-                        all_labels += [decode(t)]
-                        all_predictions += [decode(p)]
-
-            p, r, f1, fpr, tp, fp, fn = Metrics.compute(all_inputs, all_labels, all_predictions)
-
-            result = {
-                "eval_p": p * 100,
-                "eval_r": r * 100,
-                "eval_f1": f1 * 100,
-                "eval_fpr": fpr * 100,
-            }
-            avg += f1 * 100
-            logger.info("{}: F1 = {}".format(cat.upper(), f1 * 100))
-
-        avg /= 8
-        logger.info("AVG: F1 = {}".format(avg))
+            output_file = os.path.join(args.output_dir, "submission_{}_{}.csv".format(args.model_type, int(time.time())))
+            with open(output_file, "w") as writer:
+                writer.write("ID,Output\n")
+                for i, prediction in enumerate(all_predictions):
+                    writer.write('{},"{}"\n'.format(i, "".join(prediction)))
+            logger.info("Predictions saved to {}".format(output_file))
 
 
 if __name__ == "__main__":

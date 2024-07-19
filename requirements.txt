@@ -1,0 +1,12 @@
+transformers
+peft
+numpy
+tqdm
+accelerate
+jsonlines
+scikit-learn
+scipy
+tensorboard
+sentencepiece
+bitsandbytes
+xformers
